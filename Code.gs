@@ -2,18 +2,23 @@
  * Контроль школьных оценок: Google Таблица + Telegram-бот.
  * Весь код в одном файле — вставляется в Apps Script одним куском.
  *
- * Почему настройки вынесены на лист: их меняют часто, код — редко.
- * Почему токен уезжает в PropertiesService: лист видит каждый, кому дан доступ
- * к таблице, а Properties доступны только владельцу скрипта.
+ * Разметка листа предмета взята из существующей таблицы и НЕ переделывается:
+ *   A1 «Предмет:», B1 — название
+ *   строка 3 — заголовки
+ *   строка 4 «Год», строка 5 «1 Четверть» со средним баллом
+ *   оценки — с 6-й строки
+ * Скрипт только дописывает справа две служебные колонки: «Тема» и «Статус».
  */
 
 const SHEET_SETTINGS = 'Настройки';
 const SHEET_LIST = 'Список';
 const SHEET_STATE = '_Состояния';
 
-// Порядок колонок на листе предмета. Меняется в одном месте — работает везде.
-const COL = { DATE: 1, GRADE: 2, TOPIC: 3, REASON: 4, RETAKE: 5, RESULT: 6, STATUS: 7 };
-const HEADERS = ['Дата', 'Оценка', 'Тема', 'Причина', 'Дата пересдачи', 'Результат', 'Статус'];
+// Колонки листа предмета. A–E были в таблице изначально, F и G добавляет скрипт.
+const COL = { DATE: 1, GRADE: 2, REASON: 3, RETAKE: 4, RESULT: 5, TOPIC: 6, STATUS: 7 };
+const HEADER_ROW = 3;   // строка с заголовками
+const DATA_ROW = 6;     // первая строка с оценками (строки 4–5 заняты «Год» и «1 Четверть»)
+const QUARTER_LAST_ROW = 20; // конец блока 1 четверти — его же охватывает формула среднего
 
 // Статусы ставит только скрипт: по ним он понимает, чего ждёт от следующего сообщения.
 const ST = {
@@ -33,16 +38,15 @@ const ROLES = {
 };
 
 // Значения по умолчанию для листа «Настройки»: [ключ, значение, пояснение].
-// Личные данные здесь намеренно пустые — репозиторий открытый, и заполняются они сами.
 const DEFAULT_SETTINGS = [
   ['BOT_TOKEN', '', 'Токен от @BotFather. После пункта меню «Сохранить секреты» здесь останется маска.'],
   ['WEBAPP_URL', '', 'URL веб-приложения после развёртывания. Нужен для подключения Telegram.'],
   ['GROUP_CHAT_ID', '', 'Заполнится само: отправьте в группе команду /группа.'],
-  ['CHILD_USER_ID', '', 'Заполнится само: ребёнок пишет боту /start и жмёт кнопку «Я ребёнок».'],
+  ['CHILD_USER_ID', '', 'Заполнится само: в группе команда /семья, ребёнок жмёт «Я ребёнок».'],
   ['CHILD_USERNAME', '', 'Заполнится само вместе с ID.'],
-  ['PARENT1_USER_ID', '', 'Заполнится само: отец пишет боту /start и жмёт «Я отец».'],
+  ['PARENT1_USER_ID', '', 'Заполнится само: отец жмёт «Я отец».'],
   ['PARENT1_USERNAME', '', 'Заполнится само вместе с ID.'],
-  ['PARENT2_USER_ID', '', 'Заполнится само: мать пишет боту /start и жмёт «Я мать».'],
+  ['PARENT2_USER_ID', '', 'Заполнится само: мать жмёт «Я мать».'],
   ['PARENT2_USERNAME', '', 'Заполнится само вместе с ID.'],
   ['MIN_GRADE', '4', 'Оценка НИЖЕ этого числа считается проблемной.'],
   ['ESCALATE_DAYS', '3', 'Через столько дней без даты пересдачи бот зовёт родителей.'],
@@ -171,28 +175,40 @@ function ensureSubjectSheets_(ss) {
 
   names.forEach(function (name) {
     let sh = ss.getSheetByName(name);
-    if (!sh) sh = ss.insertSheet(name);
-    prepareSubjectSheet_(sh);
+    if (!sh) { sh = ss.insertSheet(name); buildSubjectTemplate_(sh, name); }
+    ensureServiceColumns_(sh);
   });
 }
 
-function prepareSubjectSheet_(sh) {
-  const first = sh.getRange(1, 1, 2, HEADERS.length).getValues();
-  const looksReady = String(first[1][COL.GRADE - 1]).trim() === 'Оценка';
-  if (!looksReady) {
-    // Первая строка отдана под ссылку «к списку», заголовки — во второй.
-    sh.insertRowsBefore(1, 2);
-    sh.getRange(2, 1, 1, HEADERS.length).setValues([HEADERS]).setFontWeight('bold');
-  }
-  sh.setFrozenRows(2);
+/** Новый лист собираем по образцу существующих, чтобы все предметы выглядели одинаково. */
+function buildSubjectTemplate_(sh, name) {
+  sh.getRange('A1').setValue('Предмет:').setFontWeight('bold');
+  sh.getRange('B1').setValue(name).setFontSize(18).setFontWeight('bold');
+  sh.getRange(HEADER_ROW, 1, 1, 5)
+    .setValues([['Даты', 'Оценки', 'Причина', 'Дата пересдачи', 'Результат']])
+    .setFontWeight('bold').setHorizontalAlignment('center');
+  sh.getRange('A4').setValue('Год').setFontWeight('bold');
+  sh.getRange('A5').setValue('1 Четверть').setFontWeight('bold');
+  sh.getRange('B5').setFormula('=IFERROR(AVERAGE(B' + DATA_ROW + ':B' + QUARTER_LAST_ROW + '); 0)');
   sh.setColumnWidth(COL.REASON, 320);
-  sh.setColumnWidth(COL.RESULT, 220);
+}
+
+/** Дописывает «Тему» и «Статус» справа, если их ещё нет. Существующие колонки не трогает. */
+function ensureServiceColumns_(sh) {
+  if (String(sh.getRange(HEADER_ROW, COL.TOPIC).getValue()).trim() !== 'Тема') {
+    sh.getRange(HEADER_ROW, COL.TOPIC).setValue('Тема').setFontWeight('bold').setHorizontalAlignment('center');
+  }
+  if (String(sh.getRange(HEADER_ROW, COL.STATUS).getValue()).trim() !== 'Статус') {
+    sh.getRange(HEADER_ROW, COL.STATUS).setValue('Статус').setFontWeight('bold').setHorizontalAlignment('center');
+  }
+  sh.setColumnWidth(COL.TOPIC, 220);
   sh.setColumnWidth(COL.STATUS, 170);
 }
 
 /**
  * Ссылки: со «Списка» на предмет и обратно.
  * Через gid, а не через имя: лист можно переименовать, gid остаётся прежним.
+ * Обратную ссылку кладём в I1 — A1 и B1 заняты названием предмета.
  */
 function buildLinks() {
   const ss = SpreadsheetApp.getActive();
@@ -205,7 +221,7 @@ function buildLinks() {
     const sh = ss.getSheetByName(name);
     if (!sh) return;
     list.getRange(i + 1, 2).setFormula('=HYPERLINK("#gid=' + sh.getSheetId() + '";"открыть →")');
-    sh.getRange(1, 1).setFormula('=HYPERLINK("#gid=' + list.getSheetId() + '";"← к списку предметов")');
+    sh.getRange('I1').setFormula('=HYPERLINK("#gid=' + list.getSheetId() + '";"← к списку предметов")');
   });
   list.setColumnWidth(2, 120);
 }
@@ -255,13 +271,12 @@ function showRegistered() {
   SpreadsheetApp.getUi().alert(out);
 }
 
-/** Освобождает роли, чтобы можно было зарегистрироваться заново. */
 function resetRegistration() {
   Object.keys(ROLES).forEach(function (k) {
     setSetting_(ROLES[k].id, '');
     setSetting_(ROLES[k].name, '');
   });
-  SpreadsheetApp.getUi().alert('Регистрация сброшена. Все трое могут снова написать боту /start.');
+  SpreadsheetApp.getUi().alert('Регистрация сброшена. Отправьте в группе /семья и нажмите кнопки заново.');
 }
 
 /* ==================== СТРОКИ ЖУРНАЛА ==================== */
@@ -284,12 +299,12 @@ function setCell_(sh, row, col, value) { sh.getRange(row, col).setValue(value); 
 function getCell_(sh, row, col) { return sh.getRange(row, col).getValue(); }
 function setStatus_(sh, row, status) { setCell_(sh, row, COL.STATUS, status); }
 
-/** Строки начинаются с третьей: первая — ссылка, вторая — заголовки. */
+/** Оценки начинаются с DATA_ROW: выше — шапка, «Год» и средний балл за четверть. */
 function eachRow_(sh, fn) {
   const last = sh.getLastRow();
-  if (last < 3) return;
-  const values = sh.getRange(3, 1, last - 2, HEADERS.length).getValues();
-  values.forEach(function (v, i) { fn(v, i + 3); });
+  if (last < DATA_ROW) return;
+  const values = sh.getRange(DATA_ROW, 1, last - DATA_ROW + 1, COL.STATUS).getValues();
+  values.forEach(function (v, i) { fn(v, i + DATA_ROW); });
 }
 
 function fmtDate_(d) {
@@ -401,9 +416,10 @@ function handleMessage_(msg) {
     return;
   }
 
-  if (text.indexOf('/start') === 0 || text.indexOf('/id') === 0) {
-    if (isPrivate) askRole_(msg.chat.id);
-    else tgSend_(msg.chat.id, 'Напишите мне в личку /start — там представитесь.');
+  // Регистрация ролей прямо в группе: нажатие кнопки приносит боту числовой ID
+  // так же, как личное сообщение, — отдельный чат для этого не нужен.
+  if (text.indexOf('/семья') === 0 || text.indexOf('/family') === 0 || text.indexOf('/start') === 0) {
+    askRole_(msg.chat.id);
     return;
   }
 
@@ -435,12 +451,11 @@ function handleMessage_(msg) {
 }
 
 /**
- * Самостоятельная регистрация.
- * Числовой ID приходит в каждом сообщении сам — спрашивать его у человека
+ * Числовой ID приходит боту в каждом сообщении сам — спрашивать его у человека
  * или гонять к стороннему боту не нужно. Неизвестна только роль, её и спрашиваем.
  */
 function askRole_(chatId) {
-  tgButtons_(chatId, 'Здравствуйте! Кто вы в семье? Нажмите кнопку — я запомню и больше не спрошу.', [
+  tgButtons_(chatId, 'Кто есть кто? Каждый нажимает свою кнопку — я запомню и больше не спрошу.', [
     [{ text: 'Я мать', callback_data: 'reg|mother' }, { text: 'Я отец', callback_data: 'reg|father' }],
     [{ text: 'Я ребёнок', callback_data: 'reg|child' }]
   ]);
@@ -456,14 +471,12 @@ function registerRole_(cb, roleKey) {
   // Роль занимается один раз. Иначе любой, кто найдёт бота, объявит себя родителем.
   if (taken && String(taken) !== String(cb.from.id)) {
     tgAnswerCallback_(cb.id, 'Эта роль уже занята');
-    tgSend_(chatId, 'Роль «' + role.label + '» уже занята. Если это ошибка — сбросьте регистрацию в таблице: меню «Оценки → Сбросить регистрацию».');
     return;
   }
 
   setSetting_(role.id, String(cb.from.id));
   setSetting_(role.name, cb.from.username ? '@' + cb.from.username : (cb.from.first_name || ''));
-  tgAnswerCallback_(cb.id, 'Записал');
-  tgSend_(chatId, 'Готово, роль «' + role.label + '» за вами. Ничего вводить вручную не нужно.');
+  tgAnswerCallback_(cb.id, 'Записал: ' + role.label);
 }
 
 function handleCallback_(cb) {
@@ -579,7 +592,7 @@ function dropState_(key) {
 function onEditInstalled(e) {
   const sh = e.range.getSheet();
   if (isServiceSheet_(sh.getName())) return;
-  if (e.range.getColumn() !== COL.GRADE || e.range.getRow() < 3) return;
+  if (e.range.getColumn() !== COL.GRADE || e.range.getRow() < DATA_ROW) return;
 
   const grade = Number(e.range.getValue());
   if (!grade) return;
