@@ -41,8 +41,8 @@ const ROLES = {
 const DEFAULT_SETTINGS = [
   ['BOT_TOKEN', '', 'Токен от @BotFather. После пункта меню «Сохранить секреты» здесь останется маска.'],
   ['WEBAPP_URL', '', 'URL веб-приложения после развёртывания. Нужен для подключения Telegram.'],
-  ['GROUP_CHAT_ID', '', 'Заполнится само: отправьте в группе команду /группа.'],
-  ['CHILD_USER_ID', '', 'Заполнится само: в группе команда /семья, ребёнок жмёт «Я ребёнок».'],
+  ['GROUP_CHAT_ID', '', 'Заполнится само: отправьте в группе команду /group.'],
+  ['CHILD_USER_ID', '', 'Заполнится само: в группе команда /family, ребёнок жмёт «Я ребёнок».'],
   ['CHILD_USERNAME', '', 'Заполнится само вместе с ID.'],
   ['PARENT1_USER_ID', '', 'Заполнится само: отец жмёт «Я отец».'],
   ['PARENT1_USERNAME', '', 'Заполнится само вместе с ID.'],
@@ -118,6 +118,9 @@ function onOpen() {
     .addItem('3. Подключить Telegram', 'setWebhook')
     .addItem('4. Включить триггеры', 'installTriggers')
     .addItem('5. Проверить связь', 'testConnection')
+    .addSeparator()
+    .addItem('Отключить бота (аварийно)', 'stopBot')
+    .addItem('Состояние бота', 'showWebhookInfo')
     .addSeparator()
     .addItem('Кто зарегистрирован', 'showRegistered')
     .addItem('Сбросить регистрацию', 'resetRegistration')
@@ -254,7 +257,7 @@ function installTriggers() {
 function testConnection() {
   const chat = getSetting_('GROUP_CHAT_ID', '');
   if (!chat) {
-    SpreadsheetApp.getUi().alert('Группа ещё не привязана. Отправьте в группе команду /группа.');
+    SpreadsheetApp.getUi().alert('Группа ещё не привязана. Отправьте в группе команду /group.');
     return;
   }
   const r = tgSend_(chat, 'Проверка связи: бот на месте.' + sheetLink_());
@@ -276,7 +279,7 @@ function resetRegistration() {
     setSetting_(ROLES[k].id, '');
     setSetting_(ROLES[k].name, '');
   });
-  SpreadsheetApp.getUi().alert('Регистрация сброшена. Отправьте в группе /семья и нажмите кнопки заново.');
+  SpreadsheetApp.getUi().alert('Регистрация сброшена. Отправьте в группе /family и нажмите кнопки заново.');
 }
 
 /* ==================== СТРОКИ ЖУРНАЛА ==================== */
@@ -375,11 +378,39 @@ function tgAnswerCallback_(id, text) {
   return tgCall_('answerCallbackQuery', { callback_query_id: id, text: text || '' });
 }
 
+/**
+ * drop_pending_updates обязателен: если в очереди Telegram зависли старые
+ * сообщения, после подключения они прилетят все разом и бот начнёт отвечать на них.
+ * max_connections: 1 — Apps Script всё равно выполняет запросы по одному.
+ */
 function setWebhook() {
   const url = getSetting_('WEBAPP_URL', '');
   if (!url) throw new Error('Сначала разверните веб-приложение и впишите его URL в WEBAPP_URL.');
-  const r = tgCall_('setWebhook', { url: url, allowed_updates: ['message', 'callback_query'] });
+  const r = tgCall_('setWebhook', {
+    url: url,
+    allowed_updates: ['message', 'callback_query'],
+    drop_pending_updates: true,
+    max_connections: 1
+  });
   SpreadsheetApp.getUi().alert(r.ok ? 'Telegram подключён.' : 'Ошибка: ' + JSON.stringify(r));
+}
+
+/** Аварийная кнопка: бот замолкает сразу, без правки ячеек и переразвёртывания. */
+function stopBot() {
+  const r = tgCall_('deleteWebhook', { drop_pending_updates: true });
+  SpreadsheetApp.getUi().alert(r.ok
+    ? 'Бот отключён, очередь очищена. Включить обратно: «3. Подключить Telegram».'
+    : 'Ошибка: ' + JSON.stringify(r));
+}
+
+/** Диагностика: Telegram сам говорит, сколько сообщений зависло и что ему не нравится. */
+function showWebhookInfo() {
+  const r = tgCall_('getWebhookInfo', {});
+  const i = r.result || {};
+  const msg = 'Адрес: ' + (i.url || 'не задан') +
+    '\nВ очереди: ' + (i.pending_update_count === undefined ? '?' : i.pending_update_count) +
+    '\nПоследняя ошибка: ' + (i.last_error_message || 'нет');
+  SpreadsheetApp.getUi().alert(msg);
 }
 
 function sheetLink_() {
@@ -389,13 +420,39 @@ function sheetLink_() {
 
 /* ==================== ПРИЁМ СООБЩЕНИЙ ==================== */
 
+/**
+ * Зачем защита от повторов: если Telegram не счёл ответ успешным, он шлёт то же
+ * самое сообщение снова и снова. Без проверки каждый повтор — новый ответ бота
+ * в группу, и чат заваливает одинаковыми сообщениями.
+ * Номер обработанного сообщения кладём в кэш на 6 часов и дубли молча пропускаем.
+ */
+function alreadyHandled_(updateId) {
+  if (!updateId) return false;
+  const cache = CacheService.getScriptCache();
+  const key = 'upd_' + updateId;
+  if (cache.get(key)) return true;
+  cache.put(key, '1', 21600);
+  return false;
+}
+
 function doPost(e) {
+  // Блокировка нужна на случай, когда повторы прилетают одновременно и оба
+  // успевают проверить кэш до записи в него.
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(20000);
+  } catch (err) {
+    return ContentService.createTextOutput('busy');
+  }
   try {
     const update = JSON.parse(e.postData.contents);
+    if (alreadyHandled_(update.update_id)) return ContentService.createTextOutput('dup');
     if (update.message) handleMessage_(update.message);
     else if (update.callback_query) handleCallback_(update.callback_query);
   } catch (err) {
     console.error(err);
+  } finally {
+    lock.releaseLock();
   }
   return ContentService.createTextOutput('ok');
 }
@@ -404,9 +461,10 @@ function handleMessage_(msg) {
   const text = String(msg.text || '').trim();
   const isPrivate = msg.chat.type === 'private';
 
-  // Привязка группы. Отдельная команда нужна потому, что при включённом privacy mode
-  // бот видит в группе только команды и ответы на свои сообщения.
-  if (text.indexOf('/группа') === 0 || text.indexOf('/group') === 0) {
+  // Команды только латиницей: Telegram распознаёт командой лишь латинские слова
+  // после слеша, а в группе при включённом privacy mode бот видит только команды
+  // и ответы на свои сообщения. Русские варианты оставлены для личного чата.
+  if (text.indexOf('/group') === 0 || text.indexOf('/группа') === 0) {
     if (isPrivate) {
       tgSend_(msg.chat.id, 'Эту команду нужно отправить внутри семейной группы.');
     } else {
@@ -418,7 +476,7 @@ function handleMessage_(msg) {
 
   // Регистрация ролей прямо в группе: нажатие кнопки приносит боту числовой ID
   // так же, как личное сообщение, — отдельный чат для этого не нужен.
-  if (text.indexOf('/семья') === 0 || text.indexOf('/family') === 0 || text.indexOf('/start') === 0) {
+  if (text.indexOf('/family') === 0 || text.indexOf('/семья') === 0 || text.indexOf('/start') === 0) {
     askRole_(msg.chat.id);
     return;
   }
@@ -465,7 +523,6 @@ function registerRole_(cb, roleKey) {
   const role = ROLES[roleKey];
   if (!role) { tgAnswerCallback_(cb.id, 'Неизвестная роль'); return; }
 
-  const chatId = cb.message.chat.id;
   const taken = getSetting_(role.id, '');
 
   // Роль занимается один раз. Иначе любой, кто найдёт бота, объявит себя родителем.
