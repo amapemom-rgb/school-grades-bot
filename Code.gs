@@ -121,6 +121,7 @@ function onOpen() {
     .addSeparator()
     .addItem('Отключить бота (аварийно)', 'stopBot')
     .addItem('Состояние бота', 'showWebhookInfo')
+    .addItem('Убрать кнопки регистрации', 'hideRegistrationButtons')
     .addSeparator()
     .addItem('Кто зарегистрирован', 'showRegistered')
     .addItem('Сбросить регистрацию', 'resetRegistration')
@@ -436,25 +437,15 @@ function alreadyHandled_(updateId) {
 }
 
 function doPost(e) {
-  // Блокировка нужна на случай, когда повторы прилетают одновременно и оба
-  // успевают проверить кэш до записи в него.
-  const lock = LockService.getScriptLock();
-  try {
-    lock.waitLock(20000);
-  } catch (err) {
-    return ContentService.createTextOutput('busy');
-  }
   try {
     const update = JSON.parse(e.postData.contents);
-    if (alreadyHandled_(update.update_id)) return ContentService.createTextOutput('dup');
+    if (alreadyHandled_(update.update_id)) return HtmlService.createHtmlOutput('dup');
     if (update.message) handleMessage_(update.message);
     else if (update.callback_query) handleCallback_(update.callback_query);
   } catch (err) {
     console.error(err);
-  } finally {
-    lock.releaseLock();
   }
-  return ContentService.createTextOutput('ok');
+  return HtmlService.createHtmlOutput('ok');
 }
 
 function handleMessage_(msg) {
@@ -513,18 +504,58 @@ function handleMessage_(msg) {
  * или гонять к стороннему боту не нужно. Неизвестна только роль, её и спрашиваем.
  */
 function askRole_(chatId) {
-  tgButtons_(chatId, 'Кто есть кто? Каждый нажимает свою кнопку — я запомню и больше не спрошу.', [
+  var m = tgButtons_(chatId, 'Кто есть кто? Каждый нажимает свою кнопку — я запомню и больше не спрошу.', [
     [{ text: 'Я мать', callback_data: 'reg|mother' }, { text: 'Я отец', callback_data: 'reg|father' }],
-    [{ text: 'Я ребёнок', callback_data: 'reg|child' }]
+    [{ text: 'Я ребёнок', callback_data: 'reg|child' }],
+    [{ text: 'Сохранить и убрать', callback_data: 'reg|done' }]
   ]);
+  // Запоминаем сообщение, чтобы позже убрать у него кнопки из меню таблицы.
+  if (m.ok) PropertiesService.getScriptProperties().setProperty('REG_MSG', chatId + ':' + m.result.message_id);
+}
+
+/**
+ * Убирает кнопки и заменяет текст на список ролей.
+ * Записанные ID при этом не трогаются — чистится только вид сообщения в чате.
+ */
+function cleanupRegistration_(chatId, messageId) {
+  var lines = Object.keys(ROLES).map(function (k) {
+    var r = ROLES[k];
+    return r.label + ': ' + (getSetting_(r.name, '') || getSetting_(r.id, '') || '—');
+  }).join('\n');
+  tgCall_('editMessageText', {
+    chat_id: chatId,
+    message_id: messageId,
+    text: 'Роли записаны:\n' + lines
+  });
+}
+
+/** Пункт меню на случай, если кнопки остались висеть, а нажимать их некому. */
+function hideRegistrationButtons() {
+  var v = PropertiesService.getScriptProperties().getProperty('REG_MSG');
+  if (!v) {
+    SpreadsheetApp.getUi().alert('Не знаю, какое сообщение чистить. Отправьте в группе /family — новое сообщение я запомню.');
+    return;
+  }
+  var p = v.split(':');
+  cleanupRegistration_(p[0], p[1]);
+  SpreadsheetApp.getUi().alert('Кнопки убраны, роли остались на месте.');
 }
 
 function registerRole_(cb, roleKey) {
-  const role = ROLES[roleKey];
+  var chatId = cb.message.chat.id;
+  var messageId = cb.message.message_id;
+
+  // Отдельная кнопка «Сохранить и убрать»: только прибирает сообщение, роли не меняет.
+  if (roleKey === 'done') {
+    tgAnswerCallback_(cb.id, 'Убрал кнопки');
+    cleanupRegistration_(chatId, messageId);
+    return;
+  }
+
+  var role = ROLES[roleKey];
   if (!role) { tgAnswerCallback_(cb.id, 'Неизвестная роль'); return; }
 
-  const taken = getSetting_(role.id, '');
-
+  var taken = getSetting_(role.id, '');
   // Роль занимается один раз. Иначе любой, кто найдёт бота, объявит себя родителем.
   if (taken && String(taken) !== String(cb.from.id)) {
     tgAnswerCallback_(cb.id, 'Эта роль уже занята');
@@ -534,6 +565,10 @@ function registerRole_(cb, roleKey) {
   setSetting_(role.id, String(cb.from.id));
   setSetting_(role.name, cb.from.username ? '@' + cb.from.username : (cb.from.first_name || ''));
   tgAnswerCallback_(cb.id, 'Записал: ' + role.label);
+
+  // Когда заняты все три роли, сообщение убирается само — тыкать ничего не нужно.
+  var all = Object.keys(ROLES).every(function (k) { return getSetting_(ROLES[k].id, ''); });
+  if (all) cleanupRegistration_(chatId, messageId);
 }
 
 function handleCallback_(cb) {
