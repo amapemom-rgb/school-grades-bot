@@ -49,6 +49,7 @@ const DEFAULT_SETTINGS = [
   ['PARENT2_USER_ID', '', 'Заполнится само: мать жмёт «Я мать».'],
   ['PARENT2_USERNAME', '', 'Заполнится само вместе с ID.'],
   ['MIN_GRADE', '4', 'Оценка НИЖЕ этого числа считается проблемной.'],
+  ['NOTIFY_EDITS', 'да', 'Писать в группу о каждой правке журнала. Поставьте «нет», если мешает.'],
   ['ESCALATE_DAYS', '3', 'Через столько дней без даты пересдачи бот зовёт родителей.'],
   ['MORNING_HOUR', '8', 'Час утреннего напоминания.'],
   ['EVENING_HOUR', '19', 'Час вечернего вопроса «сдала?».'],
@@ -149,6 +150,11 @@ function ensureSettingsSheet_(ss) {
     sh.setColumnWidth(3, 520);
     sh.setFrozenRows(1);
   }
+  // Дописываем параметры, появившиеся в новых версиях скрипта.
+  DEFAULT_SETTINGS.forEach(function (d) {
+    if (!findSettingRow_(sh, d[0])) sh.appendRow([d[0], d[1], d[2]]);
+  });
+
   const row = findSettingRow_(sh, 'SHEET_URL');
   if (row && !sh.getRange(row, 2).getValue()) sh.getRange(row, 2).setValue(ss.getUrl());
   return sh;
@@ -600,7 +606,7 @@ function handleCallback_(cb) {
   } else if (action === 'd0') {
     setStatus_(sh, row, ST.WAIT_DATE);
     tgAnswerCallback_(cb.id, 'Хорошо');
-    tgSend_(chatId, 'Ок. Спроси у учителя и напиши дату. Если через ' + getNumSetting_('ESCALATE_DAYS', 3) + ' дня даты не будет — подключу родителей.');
+    tgButtons_(chatId, 'Ок. Спроси у учителя. Когда узнаешь дату — нажми кнопку ниже. Если через ' + getNumSetting_('ESCALATE_DAYS', 3) + ' дня даты не будет — подключу родителей.', [[{ text: 'Ввести дату', callback_data: 'dx|' + gid + '|' + row }]]);
 
   } else if (action === 'ok') {
     setCell_(sh, row, COL.RESULT, 'Пересдача прошла — проверить в журнале');
@@ -682,14 +688,18 @@ function dropState_(key) {
  * из него не уйдёт.
  */
 function onEditInstalled(e) {
-  const sh = e.range.getSheet();
+  var sh = e.range.getSheet();
   if (isServiceSheet_(sh.getName())) return;
-  if (e.range.getColumn() !== COL.GRADE || e.range.getRow() < DATA_ROW) return;
+  var row = e.range.getRow();
+  var col = e.range.getColumn();
+  if (row < DATA_ROW || col > COL.STATUS) return;
 
-  const grade = Number(e.range.getValue());
-  if (!grade) return;
+  notifyEdit_(e, sh, row, col);
+  if (col !== COL.GRADE) return;
 
-  const row = e.range.getRow();
+  var grade = Number(e.range.getValue());
+  if (!grade) { setStatus_(sh, row, ''); return; }
+
   if (!getCell_(sh, row, COL.DATE)) setCell_(sh, row, COL.DATE, new Date());
 
   if (grade >= getNumSetting_('MIN_GRADE', 4)) {
@@ -698,12 +708,40 @@ function onEditInstalled(e) {
   }
 
   setStatus_(sh, row, ST.WAIT_REASON);
-  const chatId = getSetting_('GROUP_CHAT_ID', '');
+  var chatId = getSetting_('GROUP_CHAT_ID', '');
   if (!chatId) return;
-  const text = getSetting_('CHILD_USERNAME', '') + ', по предмету <b>' + sh.getName() + '</b> оценка <b>' +
-    grade + '</b>.\nОтветь на это сообщение одним текстом:\n<i>тема работы — почему так вышло</i>';
-  const m = tgAsk_(chatId, text);
+  var NL = String.fromCharCode(10);
+  var text = getSetting_('CHILD_USERNAME', '') + ', по предмету <b>' + sh.getName() + '</b> оценка <b>' + grade + '</b>.' + NL +
+    'Ответь на это сообщение одним текстом:' + NL + '<i>тема работы — почему так вышло</i>';
+  var m = tgAsk_(chatId, text);
   if (m.ok) saveState_(chatId + ':' + m.result.message_id, sh.getSheetId(), row, 'reason');
+}
+
+/**
+ * Любая правка в журнале уходит в группу.
+ * Лист «Настройки» намеренно исключён: там лежит токен бота, и его содержимое
+ * не должно попадать в чат.
+ */
+function notifyEdit_(e, sh, row, col) {
+  if (String(getSetting_('NOTIFY_EDITS', 'да')).toLowerCase() !== 'да') return;
+  var chatId = getSetting_('GROUP_CHAT_ID', '');
+  if (!chatId) return;
+
+  var NL = String.fromCharCode(10);
+  var cells = e.range.getNumRows() * e.range.getNumColumns();
+  var who = '';
+  try { if (e.user && e.user.getEmail()) who = ' (' + e.user.getEmail() + ')'; } catch (err) {}
+
+  if (cells > 1) {
+    tgSend_(chatId, 'Правка в таблице' + who + ': <b>' + sh.getName() + '</b>, изменено ячеек: ' + cells + sheetLink_());
+    return;
+  }
+
+  var title = String(sh.getRange(HEADER_ROW, col).getValue()).trim() || ('колонка ' + col);
+  var before = (e.oldValue === undefined || e.oldValue === '') ? 'пусто' : e.oldValue;
+  var after = e.range.getDisplayValue() || 'пусто';
+  tgSend_(chatId, 'Правка в таблице' + who + ':' + NL + '<b>' + sh.getName() + '</b>, строка ' + '' + row +
+    ', «' + title + '»' + NL + before + ' → ' + after + sheetLink_());
 }
 
 /** Утро: напоминание о завтрашней пересдаче и подталкивание тех, кто тянет с датой. */
