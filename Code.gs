@@ -757,14 +757,30 @@ function eveningRoutine() {
   });
 }
 
-/** Зовём родителей: сначала в группу с упоминанием, затем лично — если известен ID. */
+/**
+ * Упоминание через числовой ID, а не через @username.
+ * Так уведомление приходит даже тем, у кого юзернейма нет, и не зависит от того,
+ * открывал человек личный чат с ботом или нет.
+ */
+function mention_(idKey, nameKey, fallback) {
+  var id = getSetting_(idKey, '');
+  var name = getSetting_(nameKey, '') || fallback;
+  if (id) return '<a href="tg://user?id=' + id + '">' + name + '</a>';
+  return name;
+}
+
+/**
+ * Зовём родителей. Основной канал — упоминание в группе: оно работает всегда.
+ * Личное сообщение отправляется дополнительно и только тем, кто открывал чат с ботом,
+ * — Telegram запрещает боту писать человеку первым.
+ */
 function escalate_(sh, row, why) {
-  const p1 = getSetting_('PARENT1_USERNAME', '');
-  const p2 = getSetting_('PARENT2_USERNAME', '');
-  const text = '⚠️ ' + p1 + ' ' + p2 + '\nПредмет <b>' + sh.getName() + '</b>, оценка ' +
+  var who = mention_('PARENT1_USER_ID', 'PARENT1_USERNAME', 'Папа') + ' ' +
+            mention_('PARENT2_USER_ID', 'PARENT2_USERNAME', 'Мама');
+  var text = '⚠️ ' + who + '\nПредмет <b>' + sh.getName() + '</b>, оценка ' +
     getCell_(sh, row, COL.GRADE) + ': ' + why + '. Нужно подключиться.' + sheetLink_();
 
-  const group = getSetting_('GROUP_CHAT_ID', '');
+  var group = getSetting_('GROUP_CHAT_ID', '');
   if (group) tgSend_(group, text);
   [getSetting_('PARENT1_USER_ID', ''), getSetting_('PARENT2_USER_ID', '')].forEach(function (id) {
     if (id) tgSend_(id, text);
