@@ -25,23 +25,30 @@ const ST = {
   ESCALATED: 'Эскалация родителям'
 };
 
+// Роли для самостоятельной регистрации: кнопка → пара полей в «Настройках».
+const ROLES = {
+  child: { id: 'CHILD_USER_ID', name: 'CHILD_USERNAME', label: 'ребёнок' },
+  father: { id: 'PARENT1_USER_ID', name: 'PARENT1_USERNAME', label: 'отец' },
+  mother: { id: 'PARENT2_USER_ID', name: 'PARENT2_USERNAME', label: 'мать' }
+};
+
 // Значения по умолчанию для листа «Настройки»: [ключ, значение, пояснение].
-// Личные данные здесь намеренно пустые — репозиторий открытый.
+// Личные данные здесь намеренно пустые — репозиторий открытый, и заполняются они сами.
 const DEFAULT_SETTINGS = [
   ['BOT_TOKEN', '', 'Токен от @BotFather. После пункта меню «Сохранить секреты» здесь останется маска.'],
-  ['GROUP_CHAT_ID', '', 'ID группы в Telegram (отрицательное число, например -1001234567890).'],
-  ['CHILD_USER_ID', '', 'Числовой ID ребёнка. Узнать: он пишет боту /start, потом меню «Показать мои ID».'],
-  ['CHILD_USERNAME', '', 'Юзернейм ребёнка со знаком @ — для упоминания в тексте сообщения.'],
-  ['PARENT1_USERNAME', '', 'Родитель 1 — упоминание в группе.'],
-  ['PARENT1_USER_ID', '', 'Родитель 1 — числовой ID для личного сообщения (необязательно).'],
-  ['PARENT2_USERNAME', '', 'Родитель 2 — упоминание в группе.'],
-  ['PARENT2_USER_ID', '', 'Родитель 2 — числовой ID для личного сообщения (необязательно).'],
+  ['WEBAPP_URL', '', 'URL веб-приложения после развёртывания. Нужен для подключения Telegram.'],
+  ['GROUP_CHAT_ID', '', 'Заполнится само: отправьте в группе команду /группа.'],
+  ['CHILD_USER_ID', '', 'Заполнится само: ребёнок пишет боту /start и жмёт кнопку «Я ребёнок».'],
+  ['CHILD_USERNAME', '', 'Заполнится само вместе с ID.'],
+  ['PARENT1_USER_ID', '', 'Заполнится само: отец пишет боту /start и жмёт «Я отец».'],
+  ['PARENT1_USERNAME', '', 'Заполнится само вместе с ID.'],
+  ['PARENT2_USER_ID', '', 'Заполнится само: мать пишет боту /start и жмёт «Я мать».'],
+  ['PARENT2_USERNAME', '', 'Заполнится само вместе с ID.'],
   ['MIN_GRADE', '4', 'Оценка НИЖЕ этого числа считается проблемной.'],
   ['ESCALATE_DAYS', '3', 'Через столько дней без даты пересдачи бот зовёт родителей.'],
   ['MORNING_HOUR', '8', 'Час утреннего напоминания.'],
   ['EVENING_HOUR', '19', 'Час вечернего вопроса «сдала?».'],
-  ['SHEET_URL', '', 'Ссылка на эту таблицу — бот прикладывает её к сообщениям. Заполняется сама.'],
-  ['WEBAPP_URL', '', 'URL веб-приложения после развёртывания. Нужен для подключения Telegram.']
+  ['SHEET_URL', '', 'Ссылка на эту таблицу — бот прикладывает её к сообщениям. Заполняется сама.']
 ];
 
 // Кэш на время одного запуска: лист читаем один раз, а не на каждый ключ.
@@ -67,6 +74,16 @@ function getSetting_(key, fallback) {
 function getNumSetting_(key, fallback) {
   const n = Number(getSetting_(key, fallback));
   return isNaN(n) ? fallback : n;
+}
+
+/** Запись в «Настройки» из кода. Кэш сбрасываем, иначе в этом же запуске прочитаем старое. */
+function setSetting_(key, value) {
+  const sh = SpreadsheetApp.getActive().getSheetByName(SHEET_SETTINGS);
+  const row = findSettingRow_(sh, key);
+  if (!row) return false;
+  sh.getRange(row, 2).setValue(value);
+  _settingsCache = null;
+  return true;
 }
 
 function getToken_() {
@@ -98,7 +115,8 @@ function onOpen() {
     .addItem('4. Включить триггеры', 'installTriggers')
     .addItem('5. Проверить связь', 'testConnection')
     .addSeparator()
-    .addItem('Показать мои ID', 'showKnownIds')
+    .addItem('Кто зарегистрирован', 'showRegistered')
+    .addItem('Сбросить регистрацию', 'resetRegistration')
     .addItem('Обновить ссылки на листах', 'buildLinks')
     .addToUi();
 }
@@ -109,7 +127,7 @@ function setupWorkbook() {
   ensureStateSheet_(ss);
   ensureSubjectSheets_(ss);
   buildLinks();
-  SpreadsheetApp.getUi().alert('Готово. Заполните лист «Настройки» и переходите к пункту 2.');
+  SpreadsheetApp.getUi().alert('Готово. Заполните в «Настройках» только BOT_TOKEN — остальное бот заполнит сам.');
 }
 
 function ensureSettingsSheet_(ss) {
@@ -218,13 +236,32 @@ function installTriggers() {
 }
 
 function testConnection() {
-  const r = tgSend_(getSetting_('GROUP_CHAT_ID'), 'Проверка связи: бот на месте.' + sheetLink_());
+  const chat = getSetting_('GROUP_CHAT_ID', '');
+  if (!chat) {
+    SpreadsheetApp.getUi().alert('Группа ещё не привязана. Отправьте в группе команду /группа.');
+    return;
+  }
+  const r = tgSend_(chat, 'Проверка связи: бот на месте.' + sheetLink_());
   SpreadsheetApp.getUi().alert(r.ok ? 'Сообщение ушло в группу.' : 'Ошибка: ' + JSON.stringify(r));
 }
 
-function showKnownIds() {
-  const known = PropertiesService.getScriptProperties().getProperty('KNOWN_IDS') || '(пока никто не писал боту)';
-  SpreadsheetApp.getUi().alert('Кто писал боту:\n\n' + known);
+function showRegistered() {
+  let out = '';
+  Object.keys(ROLES).forEach(function (k) {
+    const r = ROLES[k];
+    out += r.label + ': ' + (getSetting_(r.name, '') || '—') + ' ' + (getSetting_(r.id, '') || '(нет ID)') + '\n';
+  });
+  out += '\nГруппа: ' + (getSetting_('GROUP_CHAT_ID', '') || 'не привязана');
+  SpreadsheetApp.getUi().alert(out);
+}
+
+/** Освобождает роли, чтобы можно было зарегистрироваться заново. */
+function resetRegistration() {
+  Object.keys(ROLES).forEach(function (k) {
+    setSetting_(ROLES[k].id, '');
+    setSetting_(ROLES[k].name, '');
+  });
+  SpreadsheetApp.getUi().alert('Регистрация сброшена. Все трое могут снова написать боту /start.');
 }
 
 /* ==================== СТРОКИ ЖУРНАЛА ==================== */
@@ -349,11 +386,24 @@ function doPost(e) {
 }
 
 function handleMessage_(msg) {
-  rememberId_(msg.from); // копим пары «имя → id»: сам бот не знает, кто есть кто
-
   const text = String(msg.text || '').trim();
+  const isPrivate = msg.chat.type === 'private';
+
+  // Привязка группы. Отдельная команда нужна потому, что при включённом privacy mode
+  // бот видит в группе только команды и ответы на свои сообщения.
+  if (text.indexOf('/группа') === 0 || text.indexOf('/group') === 0) {
+    if (isPrivate) {
+      tgSend_(msg.chat.id, 'Эту команду нужно отправить внутри семейной группы.');
+    } else {
+      setSetting_('GROUP_CHAT_ID', String(msg.chat.id));
+      tgSend_(msg.chat.id, 'Группа привязана. Сюда я буду писать про оценки и пересдачи.');
+    }
+    return;
+  }
+
   if (text.indexOf('/start') === 0 || text.indexOf('/id') === 0) {
-    tgSend_(msg.chat.id, 'Твой ID: <code>' + msg.from.id + '</code>\nID чата: <code>' + msg.chat.id + '</code>');
+    if (isPrivate) askRole_(msg.chat.id);
+    else tgSend_(msg.chat.id, 'Напишите мне в личку /start — там представитесь.');
     return;
   }
 
@@ -385,34 +435,43 @@ function handleMessage_(msg) {
 }
 
 /**
- * Тема и причина приходят одним сообщением, чтобы не гонять ребёнка по двум вопросам.
- * Первая строка (или часть до «—») считается темой, остальное — причиной.
+ * Самостоятельная регистрация.
+ * Числовой ID приходит в каждом сообщении сам — спрашивать его у человека
+ * или гонять к стороннему боту не нужно. Неизвестна только роль, её и спрашиваем.
  */
-function saveReason_(sh, row, text) {
-  let topic = '';
-  let reason = text;
-  const parts = text.split(/\n|—|--/);
-  if (parts.length > 1) {
-    topic = parts[0].trim();
-    reason = parts.slice(1).join(' ').trim();
-  }
-  if (topic) setCell_(sh, row, COL.TOPIC, topic);
-  setCell_(sh, row, COL.REASON, reason);
-}
-
-function askRetakeDate_(sh, row, chatId) {
-  setStatus_(sh, row, ST.WAIT_DATE);
-  const tag = sh.getSheetId() + '|' + row;
-  tgButtons_(chatId, 'Когда пересдача по предмету «' + sh.getName() + '»?', [
-    [{ text: 'Завтра', callback_data: 'd1|' + tag }, { text: 'Через 3 дня', callback_data: 'd3|' + tag }],
-    [{ text: 'Ввести дату', callback_data: 'dx|' + tag }, { text: 'Ещё не знаю', callback_data: 'd0|' + tag }]
+function askRole_(chatId) {
+  tgButtons_(chatId, 'Здравствуйте! Кто вы в семье? Нажмите кнопку — я запомню и больше не спрошу.', [
+    [{ text: 'Я мать', callback_data: 'reg|mother' }, { text: 'Я отец', callback_data: 'reg|father' }],
+    [{ text: 'Я ребёнок', callback_data: 'reg|child' }]
   ]);
 }
 
+function registerRole_(cb, roleKey) {
+  const role = ROLES[roleKey];
+  if (!role) { tgAnswerCallback_(cb.id, 'Неизвестная роль'); return; }
+
+  const chatId = cb.message.chat.id;
+  const taken = getSetting_(role.id, '');
+
+  // Роль занимается один раз. Иначе любой, кто найдёт бота, объявит себя родителем.
+  if (taken && String(taken) !== String(cb.from.id)) {
+    tgAnswerCallback_(cb.id, 'Эта роль уже занята');
+    tgSend_(chatId, 'Роль «' + role.label + '» уже занята. Если это ошибка — сбросьте регистрацию в таблице: меню «Оценки → Сбросить регистрацию».');
+    return;
+  }
+
+  setSetting_(role.id, String(cb.from.id));
+  setSetting_(role.name, cb.from.username ? '@' + cb.from.username : (cb.from.first_name || ''));
+  tgAnswerCallback_(cb.id, 'Записал');
+  tgSend_(chatId, 'Готово, роль «' + role.label + '» за вами. Ничего вводить вручную не нужно.');
+}
+
 function handleCallback_(cb) {
-  rememberId_(cb.from);
   const parts = String(cb.data).split('|');
   const action = parts[0];
+
+  if (action === 'reg') { registerRole_(cb, parts[1]); return; }
+
   const gid = parts[1];
   const row = Number(parts[2]);
   const sh = getSheetByGid_(gid);
@@ -457,6 +516,31 @@ function handleCallback_(cb) {
   }
 }
 
+/**
+ * Тема и причина приходят одним сообщением, чтобы не гонять ребёнка по двум вопросам.
+ * Первая строка (или часть до «—») считается темой, остальное — причиной.
+ */
+function saveReason_(sh, row, text) {
+  let topic = '';
+  let reason = text;
+  const parts = text.split(/\n|—|--/);
+  if (parts.length > 1) {
+    topic = parts[0].trim();
+    reason = parts.slice(1).join(' ').trim();
+  }
+  if (topic) setCell_(sh, row, COL.TOPIC, topic);
+  setCell_(sh, row, COL.REASON, reason);
+}
+
+function askRetakeDate_(sh, row, chatId) {
+  setStatus_(sh, row, ST.WAIT_DATE);
+  const tag = sh.getSheetId() + '|' + row;
+  tgButtons_(chatId, 'Когда пересдача по предмету «' + sh.getName() + '»?', [
+    [{ text: 'Завтра', callback_data: 'd1|' + tag }, { text: 'Через 3 дня', callback_data: 'd3|' + tag }],
+    [{ text: 'Ввести дату', callback_data: 'dx|' + tag }, { text: 'Ещё не знаю', callback_data: 'd0|' + tag }]
+  ]);
+}
+
 /* ---------- состояние диалога ---------- */
 
 function saveState_(key, gid, row, expects) {
@@ -485,19 +569,6 @@ function dropState_(key) {
   }
 }
 
-/**
- * Бот получает от Telegram только пару «id + имя/юзернейм». Кто из них ребёнок,
- * а кто родитель, он сам не знает — поэтому просто копит список, а сопоставление
- * делает человек один раз, вписывая нужный id в лист «Настройки».
- */
-function rememberId_(from) {
-  if (!from) return;
-  const props = PropertiesService.getScriptProperties();
-  const cur = props.getProperty('KNOWN_IDS') || '';
-  const line = (from.username ? '@' + from.username : from.first_name) + ' → ' + from.id;
-  if (cur.indexOf('→ ' + from.id) === -1) props.setProperty('KNOWN_IDS', cur + line + '\n');
-}
-
 /* ==================== ТРИГГЕРЫ ==================== */
 
 /**
@@ -522,7 +593,8 @@ function onEditInstalled(e) {
   }
 
   setStatus_(sh, row, ST.WAIT_REASON);
-  const chatId = getSetting_('GROUP_CHAT_ID');
+  const chatId = getSetting_('GROUP_CHAT_ID', '');
+  if (!chatId) return;
   const text = getSetting_('CHILD_USERNAME', '') + ', по предмету <b>' + sh.getName() + '</b> оценка <b>' +
     grade + '</b>.\nОтветь на это сообщение одним текстом:\n<i>тема работы — почему так вышло</i>';
   const m = tgAsk_(chatId, text);
@@ -531,7 +603,8 @@ function onEditInstalled(e) {
 
 /** Утро: напоминание о завтрашней пересдаче и подталкивание тех, кто тянет с датой. */
 function morningRoutine() {
-  const chatId = getSetting_('GROUP_CHAT_ID');
+  const chatId = getSetting_('GROUP_CHAT_ID', '');
+  if (!chatId) return;
   const today = new Date();
   const tomorrow = addDays_(today, 1);
   const limit = getNumSetting_('ESCALATE_DAYS', 3);
@@ -559,7 +632,8 @@ function morningRoutine() {
 
 /** Вечер: у кого сегодня была пересдача — спрашиваем результат. */
 function eveningRoutine() {
-  const chatId = getSetting_('GROUP_CHAT_ID');
+  const chatId = getSetting_('GROUP_CHAT_ID', '');
+  if (!chatId) return;
   const today = new Date();
 
   subjectSheets_().forEach(function (sh) {
@@ -585,7 +659,8 @@ function escalate_(sh, row, why) {
   const text = '⚠️ ' + p1 + ' ' + p2 + '\nПредмет <b>' + sh.getName() + '</b>, оценка ' +
     getCell_(sh, row, COL.GRADE) + ': ' + why + '. Нужно подключиться.' + sheetLink_();
 
-  tgSend_(getSetting_('GROUP_CHAT_ID'), text);
+  const group = getSetting_('GROUP_CHAT_ID', '');
+  if (group) tgSend_(group, text);
   [getSetting_('PARENT1_USER_ID', ''), getSetting_('PARENT2_USER_ID', '')].forEach(function (id) {
     if (id) tgSend_(id, text);
   });
