@@ -364,7 +364,7 @@ function tgCall_(method, payload) {
 }
 
 function tgSend_(chatId, text, extra) {
-  const payload = Object.assign({ chat_id: chatId, text: text, parse_mode: 'HTML' }, extra || {});
+  const payload = Object.assign({ chat_id: chatId, text: text, parse_mode: 'HTML', disable_web_page_preview: true }, extra || {});
   return tgCall_('sendMessage', payload);
 }
 
@@ -727,21 +727,16 @@ function notifyEdit_(e, sh, row, col) {
   var chatId = getSetting_('GROUP_CHAT_ID', '');
   if (!chatId) return;
 
-  var NL = String.fromCharCode(10);
-  var cells = e.range.getNumRows() * e.range.getNumColumns();
-  var who = '';
-  try { if (e.user && e.user.getEmail()) who = ' (' + e.user.getEmail() + ')'; } catch (err) {}
+  // Пишем только когда переписали то, что в ячейке уже было.
+  // Первичный ввод — обычное заполнение таблицы, сообщать о нём незачем.
+  if (e.oldValue === undefined || e.oldValue === '') return;
 
-  if (cells > 1) {
-    tgSend_(chatId, 'Правка в таблице' + who + ': <b>' + sh.getName() + '</b>, изменено ячеек: ' + cells + sheetLink_());
-    return;
-  }
+  // Массовую вставку пропускаем: старые значения по каждой ячейке всё равно неизвестны.
+  if (e.range.getNumRows() * e.range.getNumColumns() > 1) return;
 
   var title = String(sh.getRange(HEADER_ROW, col).getValue()).trim() || ('колонка ' + col);
-  var before = (e.oldValue === undefined || e.oldValue === '') ? 'пусто' : e.oldValue;
   var after = e.range.getDisplayValue() || 'пусто';
-  tgSend_(chatId, 'Правка в таблице' + who + ':' + NL + '<b>' + sh.getName() + '</b>, строка ' + '' + row +
-    ', «' + title + '»' + NL + before + ' → ' + after + sheetLink_());
+  tgSend_(chatId, sh.getName() + ', строка ' + row + ', ' + title + ': ' + e.oldValue + ' → ' + after);
 }
 
 /** Утро: напоминание о завтрашней пересдаче и подталкивание тех, кто тянет с датой. */
