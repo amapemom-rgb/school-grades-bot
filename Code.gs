@@ -122,6 +122,7 @@ function onOpen() {
     .addSeparator()
     .addItem('Отключить бота (аварийно)', 'stopBot')
     .addItem('Состояние бота', 'showWebhookInfo')
+    .addItem('Собрать незакрытые', 'resendOpen')
     .addItem('Убрать кнопки регистрации', 'hideRegistrationButtons')
     .addSeparator()
     .addItem('Кто зарегистрирован', 'showRegistered')
@@ -181,7 +182,7 @@ function ensureSubjectSheets_(ss) {
   if (!list) throw new Error('Нет листа «Список» с перечнем предметов.');
   const names = list.getRange(1, 1, list.getLastRow(), 1).getValues()
     .map(function (r) { return String(r[0]).trim(); })
-    .filter(function (n) { return n && n.toLowerCase() !== 'список'; });
+    .filter(function (n) { return n && n.toLowerCase() !== 'список' && n.toLowerCase() !== 'предмет'; });
 
   names.forEach(function (name) {
     let sh = ss.getSheetByName(name);
@@ -220,20 +221,58 @@ function ensureServiceColumns_(sh) {
  * Через gid, а не через имя: лист можно переименовать, gid остаётся прежним.
  * Обратную ссылку кладём в I1 — A1 и B1 заняты названием предмета.
  */
+/**
+ * Шапка листа «Список». Нужна, чтобы подписать колонки со счётчиками.
+ * Вставляется один раз: если A1 уже «Предмет», ничего не трогаем.
+ */
+function ensureListHeader_(list) {
+  if (String(list.getRange('A1').getValue()).trim() === 'Предмет') return;
+  list.insertRowsBefore(1, 1);
+  list.getRange(1, 1, 1, 4)
+    .setValues([['Предмет', 'Ссылка', 'Долги', 'Просрочено']])
+    .setFontWeight('bold');
+  list.setFrozenRows(1);
+}
+
+/**
+ * Ссылки со «Списка» на предмет и обратно плюс счётчики долгов.
+ * Через gid, а не через имя: лист можно переименовать, gid остаётся прежним.
+ * Обратную ссылку кладём в I1 — A1 и B1 заняты названием предмета.
+ *
+ * Счётчики сделаны формулами, а не скриптом: так цифры пересчитываются сами
+ * при каждой правке журнала, и бот для этого запускать не нужно.
+ */
 function buildLinks() {
   const ss = SpreadsheetApp.getActive();
   const list = ss.getSheetByName(SHEET_LIST);
+  ensureListHeader_(list);
   const rows = list.getRange(1, 1, list.getLastRow(), 1).getValues();
 
   rows.forEach(function (r, i) {
     const name = String(r[0]).trim();
-    if (!name) return;
+    if (!name || name === 'Предмет') return;
     const sh = ss.getSheetByName(name);
     if (!sh) return;
-    list.getRange(i + 1, 2).setFormula('=HYPERLINK("#gid=' + sh.getSheetId() + '";"открыть →")');
+
+    const rowNum = i + 1;
+    const ref = '"\'"&$A' + rowNum + '&"\'!';
+
+    list.getRange(rowNum, 2).setFormula('=HYPERLINK("#gid=' + sh.getSheetId() + '";"открыть →")');
+
+    // Долг: строка с непустым статусом, который ещё не «Закрыто».
+    list.getRange(rowNum, 3).setFormula(
+      '=IFERROR(COUNTIFS(INDIRECT(' + ref + 'G6:G");"<>";INDIRECT(' + ref + 'G6:G");"<>Закрыто");0)');
+
+    // Просрочка: долг, у которого дата пересдачи уже прошла.
+    list.getRange(rowNum, 4).setFormula(
+      '=IFERROR(COUNTIFS(INDIRECT(' + ref + 'G6:G");"<>";INDIRECT(' + ref + 'G6:G");"<>Закрыто";INDIRECT(' + ref + 'D6:D");"<>";INDIRECT(' + ref + 'D6:D");"<"&TODAY());0)');
+
     sh.getRange('I1').setFormula('=HYPERLINK("#gid=' + list.getSheetId() + '";"← к списку предметов")');
   });
+
   list.setColumnWidth(2, 120);
+  list.setColumnWidth(3, 90);
+  list.setColumnWidth(4, 110);
 }
 
 function saveSecrets() {
@@ -502,6 +541,8 @@ function handleMessage_(msg) {
     setStatus_(sh, state.row, ST.PLANNED);
     dropState_(key);
     tgSend_(msg.chat.id, 'Записал: пересдача «' + sh.getName() + '» — ' + fmtDate_(d) + '. Напомню накануне.');
+    activeSet_('');
+    notifyNext_();
   }
 }
 
@@ -583,6 +624,17 @@ function handleCallback_(cb) {
 
   if (action === 'reg') { registerRole_(cb, parts[1]); return; }
 
+  if (action === 'ans') {
+    tgAnswerCallback_(cb.id, '');
+    var shA = getSheetByGid_(parts[1]);
+    if (!shA) return;
+    var NL = String.fromCharCode(10);
+    var q = tgAsk_(cb.message.chat.id, getSetting_('CHILD_USERNAME', '') + ', предмет <b>' + shA.getName() +
+      '</b>. Ответь на это сообщение одним текстом:' + NL + '<i>тема работы — почему так вышло</i>');
+    if (q.ok) saveState_(cb.message.chat.id + ':' + q.result.message_id, parts[1], Number(parts[2]), 'reason');
+    return;
+  }
+
   const gid = parts[1];
   const row = Number(parts[2]);
   const sh = getSheetByGid_(gid);
@@ -597,6 +649,8 @@ function handleCallback_(cb) {
     setStatus_(sh, row, ST.PLANNED);
     tgAnswerCallback_(cb.id, 'Записал');
     tgSend_(chatId, 'Пересдача «' + sh.getName() + '» — ' + fmtDate_(d) + '. Напомню накануне.');
+    activeSet_('');
+    notifyNext_();
 
   } else if (action === 'dx') {
     tgAnswerCallback_(cb.id, '');
@@ -607,6 +661,8 @@ function handleCallback_(cb) {
     setStatus_(sh, row, ST.WAIT_DATE);
     tgAnswerCallback_(cb.id, 'Хорошо');
     tgButtons_(chatId, 'Ок. Спроси у учителя. Когда узнаешь дату — нажми кнопку ниже. Если через ' + getNumSetting_('ESCALATE_DAYS', 3) + ' дня даты не будет — подключу родителей.', [[{ text: 'Ввести дату', callback_data: 'dx|' + gid + '|' + row }]]);
+    activeSet_('');
+    notifyNext_();
 
   } else if (action === 'ok') {
     setCell_(sh, row, COL.RESULT, 'Пересдача прошла — проверить в журнале');
@@ -708,13 +764,75 @@ function onEditInstalled(e) {
   }
 
   setStatus_(sh, row, ST.WAIT_REASON);
+  notifyNext_();
+}
+
+/* ---------- очередь вопросов ---------- */
+
+function activeKey_() {
+  return PropertiesService.getScriptProperties().getProperty('ACTIVE_ROW') || '';
+}
+
+function activeSet_(v) {
+  PropertiesService.getScriptProperties().setProperty('ACTIVE_ROW', v || '');
+}
+
+/**
+ * В работе всегда одна оценка. Пока по текущей не назначена дата пересдачи,
+ * следующая не спрашивается: иначе ребёнку прилетает три вопроса подряд
+ * и непонятно, на какой из них он отвечает.
+ * Сам вопрос тоже не задаётся сразу — сначала короткое сообщение с кнопкой
+ * «Ответить», чтобы окно ответа открылось только когда ребёнок готов.
+ */
+function notifyNext_() {
+  if (activeKey_()) return;
   var chatId = getSetting_('GROUP_CHAT_ID', '');
   if (!chatId) return;
+
+  var sheets = subjectSheets_();
+  for (var i = 0; i < sheets.length; i++) {
+    var sh = sheets[i];
+    var found = 0;
+    eachRow_(sh, function (v, row) {
+      if (!found && v[COL.STATUS - 1] === ST.WAIT_REASON) found = row;
+    });
+    if (!found) continue;
+
+    var tag = sh.getSheetId() + '|' + found;
+    activeSet_(tag);
+    tgButtons_(chatId, getSetting_('CHILD_USERNAME', '') + ', по предмету <b>' + sh.getName() +
+      '</b> оценка <b>' + getCell_(sh, found, COL.GRADE) + '</b>.', [
+      [{ text: 'Ответить', callback_data: 'ans|' + tag }]
+    ]);
+    return;
+  }
+}
+
+/**
+ * Разослать заново то, что осталось незакрытым.
+ * История правок нигде не хранится, поэтому собираем не «что менялось»,
+ * а текущие долги: строки, у которых статус не «Закрыто».
+ */
+function resendOpen() {
+  var chatId = getSetting_('GROUP_CHAT_ID', '');
+  if (!chatId) { SpreadsheetApp.getUi().alert('Группа не привязана.'); return; }
+
   var NL = String.fromCharCode(10);
-  var text = getSetting_('CHILD_USERNAME', '') + ', по предмету <b>' + sh.getName() + '</b> оценка <b>' + grade + '</b>.' + NL +
-    'Ответь на это сообщение одним текстом:' + NL + '<i>тема работы — почему так вышло</i>';
-  var m = tgAsk_(chatId, text);
-  if (m.ok) saveState_(chatId + ':' + m.result.message_id, sh.getSheetId(), row, 'reason');
+  var lines = [];
+  subjectSheets_().forEach(function (sh) {
+    eachRow_(sh, function (v, row) {
+      var st = v[COL.STATUS - 1];
+      if (!st || st === ST.DONE) return;
+      lines.push(sh.getName() + ', оценка ' + v[COL.GRADE - 1] + ' — ' + st);
+    });
+  });
+
+  if (!lines.length) { SpreadsheetApp.getUi().alert('Незакрытых оценок нет.'); return; }
+
+  tgSend_(chatId, '<b>Незакрытые оценки</b>' + NL + lines.join(NL));
+  activeSet_('');
+  notifyNext_();
+  SpreadsheetApp.getUi().alert('Отправил в группу список: ' + lines.length + '. Вопрос задан по первой.');
 }
 
 /**
