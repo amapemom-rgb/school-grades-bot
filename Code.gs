@@ -242,6 +242,34 @@ function ensureListHeader_(list) {
  * Счётчики сделаны формулами, а не скриптом: так цифры пересчитываются сами
  * при каждой правке журнала, и бот для этого запускать не нужно.
  */
+/**
+ * Вид колонок «Долги» и «Просрочено».
+ * Ноль прячем форматом числа, а не формулой: формула продолжает считать,
+ * просто пустая клетка читается спокойнее, чем ряд нулей.
+ * Заливка — градиент: чем больше долгов, тем насыщеннее красный.
+ * Максимум взят на 5 — дальше цвет не усиливается, чтобы лист не рябил.
+ */
+function applyDebtFormatting_(list) {
+  var last = Math.max(list.getLastRow(), 2);
+  var range = list.getRange(2, 3, last - 1, 2);
+
+  range.setNumberFormat('0;-0;;');
+
+  // Старое правило по этому же диапазону убираем, иначе они копятся при каждом запуске.
+  var kept = list.getConditionalFormatRules().filter(function (r) {
+    var rs = r.getRanges();
+    return !(rs.length === 1 && rs[0].getColumn() === 3 && rs[0].getNumColumns() === 2);
+  });
+
+  kept.push(SpreadsheetApp.newConditionalFormatRule()
+    .setGradientMinpointWithValue('#FFFFFF', SpreadsheetApp.InterpolationType.NUMBER, '0')
+    .setGradientMaxpointWithValue('#E06666', SpreadsheetApp.InterpolationType.NUMBER, '5')
+    .setRanges([range])
+    .build());
+
+  list.setConditionalFormatRules(kept);
+}
+
 function buildLinks() {
   const ss = SpreadsheetApp.getActive();
   const list = ss.getSheetByName(SHEET_LIST);
@@ -273,6 +301,7 @@ function buildLinks() {
   list.setColumnWidth(2, 120);
   list.setColumnWidth(3, 90);
   list.setColumnWidth(4, 110);
+  applyDebtFormatting_(list);
 }
 
 function saveSecrets() {
